@@ -2,3 +2,4 @@ mysql-connector-python
 googlemaps
 folium
 flask
+gunicorn
