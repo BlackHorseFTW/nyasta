@@ -7,16 +7,16 @@ import googlemaps
 import time
 from collections import defaultdict
 
-# Database configuration
+# Database configuration from environment variables
 config_nsmm_trans = {
-    "host": "103.211.36.126",
-    "user": "gramthejus",
-    "password": "gtfm123",
-    "database": "NSMM_TRANS"
+    "host": os.environ.get("DB_HOST", "103.211.36.126"),
+    "user": os.environ.get("DB_USER", "gramthejus"),
+    "password": os.environ.get("DB_PASSWORD", "gtfm123"),
+    "database": os.environ.get("DB_NAME", "NSMM_TRANS")
 }
 
-# Google Maps API Key
-GOOGLE_API_KEY = "AIzaSyBpF_YKl7yap8SZSUUvTNEco9PtVMXugiU"
+# Google Maps API Key from environment
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "AIzaSyBpF_YKl7yap8SZSUUvTNEco9PtVMXugiU")
 
 # Initialize Google Maps client
 gmaps = googlemaps.Client(key=GOOGLE_API_KEY)
@@ -105,6 +105,7 @@ def analyze_signal_strength_by_apn_type(group):
 
 # Fetch and process data
 def fetch_coordinates_and_group():
+    conn = None
     try:
         conn = mysql.connector.connect(**config_nsmm_trans)
         cursor = conn.cursor()
@@ -135,7 +136,8 @@ def fetch_coordinates_and_group():
                     'signal_strength': signal_strength,
                     'apn_type': apn_type
                 })
-                time.sleep(0.1)
+                # Reduced API call frequency to avoid rate limits
+                time.sleep(0.2)
             except (ValueError, TypeError):
                 invalid_data_count += 1
                 print(f"Skipping invalid data: Device ID={device_id}, Latitude={latitude}, Longitude={longitude}")
@@ -157,49 +159,85 @@ app = Flask(__name__)
 
 @app.route('/')
 def map_view():
-    groups = fetch_coordinates_and_group()
-    m = folium.Map(location=[17.450636, 78.387154], zoom_start=13, tiles=None)
-
-    folium.TileLayer(
-        tiles=f"https://mt1.google.com/vt/lyrs=m&x={{x}}&y={{y}}&z={{z}}&key={GOOGLE_API_KEY}",
-        attr="Google Maps",
-        name="Google Maps",
-        overlay=False,
-        control=True
-    ).add_to(m)
-
-    for group_index, group in enumerate(groups, start=1):
-        cluster_latitudes = [loc['latitude'] for loc in group]
-        cluster_longitudes = [loc['longitude'] for loc in group]
-        cluster_center = [sum(cluster_latitudes)/len(cluster_latitudes), sum(cluster_longitudes)/len(cluster_longitudes)]
-
-        max_radius = max(haversine(cluster_center[0], cluster_center[1], loc['latitude'], loc['longitude']) for loc in group)
-
-        folium.Circle(
-            location=cluster_center,
-            radius=max_radius,
-            color="black",
-            fill=True,
-            fill_opacity=0.2
-        ).add_to(m)
-
-        for loc in group:
-            apn_type = loc['apn_type']
-            color = APN_COLORS.get(apn_type, APN_COLORS["default"])
-            folium.Marker(
-                location=[loc['latitude'], loc['longitude']],
-                popup=f"{loc['device_id']}<br>{loc['address']}<br>Signal: {loc['signal_strength']}<br>APN Type: {apn_type}",
-                icon=folium.Icon(color=color, icon='info-sign')
-            ).add_to(m)
-
-    templates_dir = "templates"
+    # Get absolute path to the templates directory
+    templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
     if not os.path.exists(templates_dir):
         os.makedirs(templates_dir)
-
+    
     map_html = os.path.join(templates_dir, 'map.html')
-    m.save(map_html)
+    
+    # Check if we need to regenerate the map
+    regenerate = True
+    if os.path.exists(map_html):
+        # Only regenerate if file is older than 15 minutes
+        file_age = time.time() - os.path.getmtime(map_html)
+        if file_age < 900:  # 15 minutes = 900 seconds
+            regenerate = False
+    
+    if regenerate:
+        groups = fetch_coordinates_and_group()
+        
+        # Default center location if no data
+        center_lat, center_lon = 17.450636, 78.387154
+        
+        # If we have data, center on the first group
+        if groups and len(groups) > 0 and len(groups[0]) > 0:
+            first_group = groups[0]
+            lats = [loc['latitude'] for loc in first_group]
+            lons = [loc['longitude'] for loc in first_group]
+            center_lat = sum(lats) / len(lats)
+            center_lon = sum(lons) / len(lons)
+        
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=13, tiles=None)
+
+        folium.TileLayer(
+            tiles=f"https://mt1.google.com/vt/lyrs=m&x={{x}}&y={{y}}&z={{z}}&key={GOOGLE_API_KEY}",
+            attr="Google Maps",
+            name="Google Maps",
+            overlay=False,
+            control=True
+        ).add_to(m)
+
+        for group_index, group in enumerate(groups, start=1):
+            cluster_latitudes = [loc['latitude'] for loc in group]
+            cluster_longitudes = [loc['longitude'] for loc in group]
+            cluster_center = [sum(cluster_latitudes)/len(cluster_latitudes), sum(cluster_longitudes)/len(cluster_longitudes)]
+
+            max_radius = max(haversine(cluster_center[0], cluster_center[1], loc['latitude'], loc['longitude']) for loc in group)
+
+            folium.Circle(
+                location=cluster_center,
+                radius=max_radius,
+                color="black",
+                fill=True,
+                fill_opacity=0.2
+            ).add_to(m)
+
+            for loc in group:
+                apn_type = loc['apn_type']
+                color = APN_COLORS.get(apn_type, APN_COLORS["default"])
+                folium.Marker(
+                    location=[loc['latitude'], loc['longitude']],
+                    popup=f"{loc['device_id']}<br>{loc['address']}<br>Signal: {loc['signal_strength']}<br>APN Type: {apn_type}",
+                    icon=folium.Icon(color=color, icon='info-sign')
+                ).add_to(m)
+
+        m.save(map_html)
+    
+    # Add a meta refresh tag in the template
+    with open(map_html, 'r') as file:
+        html_content = file.read()
+    
+    if '<meta http-equiv="refresh" content="900">' not in html_content:
+        html_content = html_content.replace('</head>', '<meta http-equiv="refresh" content="900"></head>')
+        with open(map_html, 'w') as file:
+            file.write(html_content)
 
     return render_template('map.html')
 
+# For PythonAnywhere, make sure 'application' is defined for WSGI
+application = app
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Only use this when running locally, not on PythonAnywhere
+    app.run(debug=False, host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
